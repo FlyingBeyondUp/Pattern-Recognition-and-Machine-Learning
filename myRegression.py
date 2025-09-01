@@ -95,14 +95,22 @@ class LinearRegression(MyRegression):
     
 
 class BayesianLinearRegression(MyRegression):
-    def __init__(self,alpha_init=1e-3,beta_init=1e-1,tol=1e-3,max_iter=1000,n_interval=10):
+    def __init__(self,alpha_init=None,beta_init=None,ridge_init=1e-3,tol=1e-3,max_iter=1000,n_interval=10):
         self.alpha=alpha_init
         self.beta=beta_init
+        self.ridge_init=ridge_init
         self.tol=tol
         self.max_iter=max_iter
         self.n_interval=n_interval
         self.m=None
         self.S=None
+    
+    def _initialize(self,X,y):
+        base_learner=LinearRegression(self.ridge_init)
+        base_learner.fit(X, y)
+        self.alpha=1/(torch.linalg.norm(base_learner.w,2)**2+1e-6)
+        self.beta=base_learner.beta
+        return
     
     def fit(self,X,y,record_log_evidence=[],requires_record=False):
         XtX=X.T@X
@@ -111,6 +119,8 @@ class BayesianLinearRegression(MyRegression):
         I=torch.eye(X.shape[1])
         N=X.shape[0]
         pre_log_evidence=-float('inf')
+        if self.alpha==None:
+            self._initialize(X, y)
         
         for i in range(self.max_iter):
             S_inv=self.alpha*I+self.beta*XtX
@@ -144,32 +154,38 @@ class BayesianLinearRegression(MyRegression):
         noise_variances=torch.einsum('ij,jk,ik->i',X,self.S,X)
         return X@self.m,1/self.beta+noise_variances
 
-# Automatic Relevance Determination
-# The current implementation is not stable
-# the performance is sensitive to alpha_init
-# even for the same parameters and training dataset, the trained model can behave in distinct ways
-# while the Bayesian Linear Regression model is more robust
+
+
 class ARDRegression(MyRegression):
-    def __init__(self,alpha_init=1e-5,beta_init=1e-1,tol=1e-3,max_iter=1000,n_interval=10,alpha_bounds=[1e-9,1e9],alpha_damp=0.5):
-        self.A=None
-        self.alpha_init=alpha_init
+    def __init__(self,alphas_init=None,beta_init=None,ridge_init=1e-3,tol=1e-3,max_iter=1000,n_interval=10,alpha_bounds=[1e-9,1e9],alpha_damp=0.5):
+        self.alphas=alphas_init
+        self.alpha_bounds=alpha_bounds
+        self.alpha_damp=alpha_damp
         self.beta=beta_init
+        self.ridge_init=ridge_init
+        
         self.tol=tol
         self.max_iter=max_iter
         self.n_interval=n_interval
-        self.alpha_bounds=alpha_bounds
-        self.alpha_damp=alpha_damp
+        
         self.m=None
         self.S=None
-        self.alphas=None
+    
+    def _initialize(self,X,y):
+        base_learner=LinearRegression(self.ridge_init)
+        base_learner.fit(X, y)
+        self.alphas=1/(base_learner.w**2+1e-6)
+        self.alphas=torch.clamp(self.alphas,self.alpha_bounds[0],self.alpha_bounds[1])
+        self.beta=base_learner.beta
+        return
     
     def fit(self,X,y,record_log_evidence=[],requires_record=False):
         Xty=X.T@y
         XtX=X.T@X
-        eigen_XtX=torch.linalg.eigvalsh(XtX)
         pre_log_evidence=-float('inf')
         N,M=X.shape
-        self.alphas=self.alpha_init*torch.ones(X.shape[1])
+        if self.alphas==None:
+            self._initialize(X,y)
         
         for i in range(self.max_iter):
             try:
@@ -185,15 +201,14 @@ class ARDRegression(MyRegression):
                 self.S=torch.linalg.inv(torch.diag(self.alphas)+self.beta*XtX)
                 self.m=self.beta*self.S@Xty
             
-            lams=self.beta*eigen_XtX
-            gamma=torch.sum(lams/(self.alphas+lams))
-            new_alphas=1/(self.m*self.m+self.S.diagonal()+1e-9)
+            gammas=torch.ones(M)-self.alphas*self.S.diagonal()
+            new_alphas=gammas/(self.m*self.m+1e-9)
             new_alphas=torch.clamp(new_alphas,self.alpha_bounds[0],self.alpha_bounds[1])
-            self.alphas=new_alphas*self.alpha_damp+(1-self.alpha_damp)*self.alphas
-            self.beta=N/(torch.linalg.norm(y-X@self.m)**2+gamma/self.beta)
+            self.alphas=self.alpha_damp*new_alphas+(1-self.alpha_damp)*self.alphas
+            self.beta=(N-torch.sum(gammas))/torch.linalg.norm(y-X@self.m,2)**2
             
             if i%self.n_interval==0:
-                log_evidence=0.5*torch.sum(torch.log(self.alphas))+0.5*X.shape[0]*torch.log(self.beta)-self.E(X,y)-0.5*torch.sum(torch.log(self.alphas+lams))-0.5*N*torch.log(2*torch.tensor(torch.pi))
+                log_evidence=0.5*torch.sum(torch.log(self.alphas))+0.5*X.shape[0]*torch.log(self.beta)-self.E(X,y)-0.5*N*torch.log(2*torch.tensor(torch.pi))
                 if torch.abs((log_evidence-pre_log_evidence)/pre_log_evidence)<self.tol:
                     break
                 pre_log_evidence=log_evidence
@@ -213,10 +228,10 @@ class ARDRegression(MyRegression):
 
 
 if __name__=='__main__':
-    n_total=200
+    n_total=100
     n_train=int(n_total*0.7)
-    n_degree=20
-    sigma=0.2
+    n_degree=0
+    sigma=0.5
     
     x,y=generate_data(n=n_total, noise=sigma)
     mean_x,std_x=x.mean(),x.std()
@@ -224,20 +239,20 @@ if __name__=='__main__':
     
     x_train,x_val=x[:n_train],x[n_train:]
     y_train,y_val=y[:n_train],y[n_train:]
-    kernel_features=KernelFeatures()
-    X_train=kernel_features.fit(x_train)
-    X_val=kernel_features.transform(x_val)
+    # kernel_features=KernelFeatures()
+    # X_train=kernel_features.fit(x_train)
+    # X_val=kernel_features.transform(x_val)
     
     
     
-    # preprocess polynomial features
-    # X=polynomial_features(x, n_degree)
-    # X_train,y_train,X_val,y_val=X[:n_train],y[:n_train],X[n_train:],y[n_train:]
-    # x_val=x[n_train:]
-    # mean = X_train[:,1:].mean(dim=0, keepdim=True)
-    # std  = X_train[:,1:].std(dim=0, keepdim=True, unbiased=False)
-    # X_train[:,1:] = (X_train[:,1:] - mean) / (std + 1e-8)
-    # X_val[:,1:]   = (X_val[:,1:] - mean) / (std + 1e-8)
+    #preprocess polynomial features
+    X=polynomial_features(x, n_degree)
+    X_train,y_train,X_val,y_val=X[:n_train],y[:n_train],X[n_train:],y[n_train:]
+    x_val=x[n_train:]
+    mean = X_train[:,1:].mean(dim=0, keepdim=True)
+    std  = X_train[:,1:].std(dim=0, keepdim=True, unbiased=False)
+    X_train[:,1:] = (X_train[:,1:] - mean) / (std + 1e-8)
+    X_val[:,1:]   = (X_val[:,1:] - mean) / (std + 1e-8)
     
     
     
@@ -246,17 +261,17 @@ if __name__=='__main__':
     ols.fit(X_train,y_train)
     y_ols=ols.predict(X_val)
     
-    ridge=LinearRegression(lam=1e-4)
+    ridge=LinearRegression(lam=1e-2)
     ridge.fit(X_train,y_train)
     y_ridge=ridge.predict(X_val)
     
-    BLR=BayesianLinearRegression(alpha_init=1e-4,beta_init=1e-1)
+    BLR=BayesianLinearRegression(ridge_init=1e-2)
     list_log_p=[]
     BLR.fit(X_train,y_train,list_log_p,requires_record=True)
     plt.plot(range(len(list_log_p)),list_log_p)
     y_BLR,_=BLR.predict(X_val)
     
-    ARD=ARDRegression(alpha_init=1e-4,beta_init=1e-1)
+    ARD=ARDRegression(ridge_init=1e-2)
     list_log_p=[]
     ARD.fit(X_train,y_train,list_log_p,requires_record=True)
     plt.plot(range(len(list_log_p)),list_log_p)
@@ -288,10 +303,10 @@ if __name__=='__main__':
     x_all=torch.linspace(0,1,1000)
     x_all=(x_all-mean_x)/(std_x+1e-8)
     
-    X_all=kernel_features.transform(x_all)
+    #X_all=kernel_features.transform(x_all)
     
-    # X_all=polynomial_features(x_all, n_degree)
-    # X_all[:,1:]=(X_all[:,1:]-mean)/(std+1e-8)
+    X_all=polynomial_features(x_all, n_degree)
+    X_all[:,1:]=(X_all[:,1:]-mean)/(std+1e-8)
     
     plt.figure()
     plt.title('ols')
@@ -363,15 +378,15 @@ if __name__=='__main__':
     
     
     # check sparsity
-    w_ARD=ARD.m.clone()
-    w_ARD=w_ARD*~torch.tensor(torch.abs(w_ARD)/torch.max(torch.abs(w_ARD))<2e-1)
+    # w_ARD=ARD.m.clone()
+    # w_ARD=w_ARD*~torch.tensor(torch.abs(w_ARD)/torch.max(torch.abs(w_ARD))<2e-1)
     
-    plt.figure()
-    plt.title('sparsity')
-    plt.plot(x_all,X_all@w_ARD)
-    plt.scatter(x_train,y_train)
-    plt.scatter(x_train[w_ARD!=0],y_train[w_ARD!=0],color='red')
-    plt.show()
+    # plt.figure()
+    # plt.title('sparsity')
+    # plt.plot(x_all,X_all@w_ARD)
+    # plt.scatter(x_train,y_train)
+    # plt.scatter(x_train[w_ARD!=0],y_train[w_ARD!=0],color='red')
+    # plt.show()
     
     
     
